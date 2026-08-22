@@ -14,11 +14,15 @@
 # Kontrolli, kas heli/hääl töötab:
 #   ./praam-watch.sh --test-alert
 #
+# WhatsApp teavitusega (CallMeBot, võtme saamine: vt README):
+#   ./praam-watch.sh --date 14.08 --time 16:00 --whatsapp +3725xxxxxxx:VÕTI
+#
 
 set -u
 
 API="https://www.praamid.ee/online/events"
 BOOK_URL="https://www.praamid.ee/portal/ticket/departure"
+WA_API="https://api.callmebot.com/whatsapp.php"
 TIME_SHIFT=300
 
 DIRECTION="RH"
@@ -34,6 +38,7 @@ ONCE=0
 LIST=0
 DEBUG=0
 TEST_ALERT=0
+WHATSAPP=""
 SILENT="${PRAAM_SILENT:-0}"
 
 # ---------------------------------------------------------------- abitekstid
@@ -57,6 +62,9 @@ Kasutamine: praam-watch.sh [valikud]
   -m, --min <arv>          mitu kohta peab vabanema, et teavitada (vaikimisi 1)
   -i, --interval <sek>     kontrolli sagedus sekundites (vaikimisi 60,
                            lubatud alates 5; nt 30 või 10)
+  -W, --whatsapp <saajad>  saada leiu korral WhatsApp sõnum CallMeBoti kaudu;
+                           saajad kujul +3725xxxxxxx:VÕTI, komadega eraldatud
+                           (lippu võib ka korrata; võtme saamine: vt README)
       --repeats <arv>      mitu korda häiret korrata (vaikimisi 6)
       --keep-going         ära lõpeta pärast häiret, jälgi edasi
       --open               ava leiu korral broneerimisleht brauseris
@@ -103,6 +111,7 @@ while [ $# -gt 0 ]; do
     -w|--watch)     WATCH="${2:-}"; shift 2 ;;
     -m|--min)       MIN="${2:-}"; shift 2 ;;
     -i|--interval)  INTERVAL="${2:-}"; shift 2 ;;
+    -W|--whatsapp)  WHATSAPP="$WHATSAPP${WHATSAPP:+,}${2:-}"; shift 2 ;;
     --repeats)      REPEATS="${2:-}"; shift 2 ;;
     --keep-going)   KEEP_GOING=1; shift ;;
     --open)         OPEN_BROWSER=1; shift ;;
@@ -113,6 +122,17 @@ while [ $# -gt 0 ]; do
     -h|--help)      usage; exit 0 ;;
     *)              die "tundmatu valik: $1 (vaata --help)" ;;
   esac
+done
+
+# valideeri siin, sest --test-alert kasutab saajaid enne põhivalideerimist
+WHATSAPP_LIST="$(printf '%s' "$WHATSAPP" | tr ',' ' ')"
+for r in $WHATSAPP_LIST; do
+  phone="${r%%:*}"; key="${r#*:}"
+  case "$phone" in
+    +[0-9]*) case "${phone#+}" in *[!0-9]*) die "--whatsapp: vigane number '$phone' (kuju: +3725xxxxxxx:VÕTI)" ;; esac ;;
+    *)       die "--whatsapp saaja peab olema kujul +3725xxxxxxx:VÕTI (sain '$r')" ;;
+  esac
+  { [ "$key" != "$r" ] && [ -n "$key" ]; } || die "--whatsapp saajal '$r' puudub API võti (kuju: +3725xxxxxxx:VÕTI)"
 done
 
 # ------------------------------------------------------------- teavitamine
@@ -174,9 +194,26 @@ open_url() {
   have xdg-open && { xdg-open "$1" >/dev/null 2>&1; return 0; }
 }
 
+# CallMeBot vastab õnnestumisel tekstiga "Message queued ..."
+notify_whatsapp() {
+  msg="$1"
+  for r in $WHATSAPP_LIST; do
+    phone="${r%%:*}"; key="${r#*:}"
+    body="$(curl -sS --max-time 25 --get "$WA_API" \
+              --data-urlencode "phone=$phone" \
+              --data-urlencode "apikey=$key" \
+              --data-urlencode "text=$msg" 2>/dev/null)"
+    case "$body" in
+      *[Qq]ueued*) printf 'WhatsApp: sõnum saadetud numbrile %s\n' "$phone" ;;
+      *)           printf 'WhatsApp: saatmine numbrile %s ebaõnnestus (kontrolli numbrit ja API võtit)\n' "$phone" >&2 ;;
+    esac
+  done
+}
+
 alert() {
   headline="$1"; spoken="$2"
   desktop_notify "Praamid.ee" "$headline"
+  notify_whatsapp "$headline — broneeri: $BOOK_URL"
   [ "$OPEN_BROWSER" = "1" ] && open_url "$BOOK_URL"
   n=0
   while [ "$n" -lt "$REPEATS" ]; do
@@ -189,6 +226,7 @@ alert() {
 
 if [ "$TEST_ALERT" = "1" ]; then
   echo "Testin häiret (heli + hääl). Kui midagi ei kuule, vaata allpool olevat nimekirja."
+  [ -n "$WHATSAPP_LIST" ] && echo "Saadan ka WhatsApp testsõnumi."
   REPEATS=2
   alert "Test" "Test. Vaba sõidukikoht praamil."
   echo
@@ -310,6 +348,11 @@ trap 'printf "\nLõpetan. Head reisi!\n"; exit 0' INT TERM
 
 printf 'Jälgin: %s, %s kell %s\n' "$DIRNAME" "$DATE" "$TIME"
 printf 'Ootan:  %s (vähemalt %s)\n' "$WATCH_HUMAN" "$MIN"
+if [ -n "$WHATSAPP_LIST" ]; then
+  WA_PHONES=""
+  for r in $WHATSAPP_LIST; do WA_PHONES="$WA_PHONES${WA_PHONES:+, }${r%%:*}"; done
+  printf 'WhatsApp: %s\n' "$WA_PHONES"
+fi
 printf 'Sagedus: iga %s sekundi järel. Katkesta Ctrl+C-ga.\n\n' "$INTERVAL"
 
 prev=""
@@ -358,7 +401,7 @@ EOF
     hit="${hit%, }"
     printf '\n[%s] *** VABA KOHT! %s ***  (%s)\n' "$(ts)" "$hit" "$cur"
     printf '    Broneeri kohe: %s\n' "$BOOK_URL"
-    alert "Vaba koht! $DIRNAME $TIME — $hit" "$SPOKEN"
+    alert "Vaba koht! $DIRNAME $DATE kell $TIME — $hit" "$SPOKEN"
     if [ "$KEEP_GOING" != "1" ]; then
       printf '\nLõpetan. (Kasuta --keep-going, kui tahad edasi jälgida.)\n'
       exit 0
